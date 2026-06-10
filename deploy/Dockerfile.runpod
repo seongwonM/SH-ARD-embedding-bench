@@ -14,6 +14,7 @@ COPY bench ./bench
 
 # RunPod 기본 실행: 4개 모델 전체, bf16, /workspace/reports 저장
 CMD ["python", "-m", "bench.mteb_runner", \
+     "--task-types", "Retrieval", \
      "--model-dtype", "auto", \
      "--batch-size", "256", \
      "--out", "/workspace/reports"]

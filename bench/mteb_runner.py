@@ -78,6 +78,63 @@ def _extract_metrics(res) -> tuple[dict, dict]:
 _DTYPE_MAP = {"auto": "auto", "fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
 
 
+def _build_combined_retrieval_task(tasks: list):
+    """
+    여러 Retrieval 태스크의 corpus/queries/qrels를 합쳐서 단일 태스크 객체 반환.
+    doc_id/query_id 충돌 방지를 위해 "<태스크명>__<원본id>" 형태로 prefix 부여.
+    """
+    import copy
+    import dataclasses
+    import warnings
+
+    combined_corpus: dict = {}
+    combined_queries: dict = {}
+    combined_qrels: dict = {}
+
+    for task in tasks:
+        name = task.metadata.name
+        print(f"  [로딩] {name}")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            task.load_data()
+
+        avail = list(task.corpus.keys())
+        split = next((s for s in ("test", "dev", "validation") if s in avail), avail[0])
+        prefix = name + "__"
+
+        for doc_id, doc in task.corpus[split].items():
+            combined_corpus[prefix + doc_id] = doc
+        for q_id, q in task.queries[split].items():
+            combined_queries[prefix + q_id] = q
+        for q_id, rels in task.relevant_docs[split].items():
+            combined_qrels[prefix + q_id] = {
+                prefix + did: score for did, score in rels.items()
+            }
+
+    print(
+        f"  [합산] corpus {len(combined_corpus):,}건 · "
+        f"queries {len(combined_queries):,}건 · "
+        f"qrel pairs {sum(len(v) for v in combined_qrels.values()):,}건"
+    )
+
+    # 첫 번째 태스크를 template으로 shallow copy 후 데이터 교체
+    combined = copy.copy(tasks[0])
+    combined.corpus         = {"test": combined_corpus}
+    combined.queries        = {"test": combined_queries}
+    combined.relevant_docs  = {"test": combined_qrels}
+    combined.data_loaded    = True
+    # MTEB가 evaluation.run() 내부에서 load_data()를 재호출하지 못하게 no-op으로 교체
+    combined.load_data = lambda **kwargs: None
+
+    try:
+        combined.metadata = copy.copy(combined.metadata)
+        combined.metadata.name = "CombinedKoreanRetrieval"
+    except (AttributeError, TypeError, dataclasses.FrozenInstanceError):
+        pass
+
+    return combined
+
+
 def _run_model(model_id: str, tasks: list, out_dir: str, batch_size: int, model_dtype: str = "auto") -> list[dict]:
     """단일 모델 평가 실행. summary 리스트 반환."""
     import mteb
@@ -96,10 +153,18 @@ def _run_model(model_id: str, tasks: list, out_dir: str, batch_size: int, model_
         print(f"[ERROR] 모델 로드 실패: {e}")
         return []
 
+    # 모든 태스크가 Retrieval이면 corpus를 합쳐서 단일 평가
+    all_retrieval = all(t.metadata.type == "Retrieval" for t in tasks)
+    if all_retrieval and len(tasks) > 1:
+        print(f"\n[합산 모드] {len(tasks)}개 Retrieval 태스크 corpus 병합 중...")
+        eval_tasks = [_build_combined_retrieval_task(tasks)]
+    else:
+        eval_tasks = tasks
+
     summary = []
     t0_model = time.time()
 
-    for task in tasks:
+    for task in eval_tasks:
         t0 = time.time()
         try:
             with warnings.catch_warnings():
@@ -124,14 +189,12 @@ def _run_model(model_id: str, tasks: list, out_dir: str, batch_size: int, model_
                 summary.append({
                     "model":        model_id,
                     "task":         res.task_name,
-                    # 요약 지표 (평균, 보기 쉬운 버전)
                     "ndcg_at_10":  m.get("ndcg_at_10"),
                     "mrr_at_10":   m.get("mrr_at_10"),
                     "recall_at_1": m.get("recall_at_1"),
                     "recall_at_5": m.get("recall_at_5"),
                     "recall_at_10":m.get("recall_at_10"),
                     "map_at_10":   m.get("map_at_10"),
-                    # 원본 전체 스코어 (split별, 언어별 포함)
                     "raw_scores":  raw,
                 })
         except Exception as e:
