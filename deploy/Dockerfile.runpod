@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     HF_DATASETS_CACHE=/workspace/datasets/.cache \
     TOKENIZERS_PARALLELISM=false
 
-WORKDIR /workspace/embedding_bench
+WORKDIR /app
 
 COPY deploy/requirements-mteb.txt ./
 RUN pip install --no-cache-dir -r requirements-mteb.txt
