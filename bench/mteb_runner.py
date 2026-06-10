@@ -78,6 +78,35 @@ def _extract_metrics(res) -> tuple[dict, dict]:
 _DTYPE_MAP = {"auto": "auto", "fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
 
 
+def _load_task_data(task) -> tuple[dict, dict, dict]:
+    """
+    HF datasets에서 직접 corpus/queries/qrels를 로드해 dict로 반환.
+    MTEB 1.34+에서 load_data()가 self.corpus를 설정하지 않으므로 직접 로드.
+    """
+    from datasets import load_dataset
+
+    meta     = task.metadata
+    path     = meta.dataset["path"]
+    revision = meta.dataset.get("revision")
+    split    = next((s for s in ("test", "dev") if s in meta.eval_splits), meta.eval_splits[0])
+
+    hf_kw: dict = {"trust_remote_code": True}
+    if revision:
+        hf_kw["revision"] = revision
+
+    corpus_ds  = load_dataset(path, "corpus",  split="corpus",  **hf_kw)
+    queries_ds = load_dataset(path, "queries", split="queries", **hf_kw)
+    qrels_ds   = load_dataset(path, "qrels",   split=split,     **hf_kw)
+
+    corpus = {r["_id"]: {"title": r.get("title", ""), "text": r["text"]} for r in corpus_ds}
+    queries = {r["_id"]: r["text"] for r in queries_ds}
+    qrels: dict = {}
+    for r in qrels_ds:
+        qrels.setdefault(r["query-id"], {})[r["corpus-id"]] = int(r.get("score", 1))
+
+    return corpus, queries, qrels
+
+
 def _build_combined_retrieval_task(tasks: list):
     """
     여러 Retrieval 태스크의 corpus/queries/qrels를 합쳐서 단일 태스크 객체 반환.
@@ -85,7 +114,6 @@ def _build_combined_retrieval_task(tasks: list):
     """
     import copy
     import dataclasses
-    import warnings
 
     combined_corpus: dict = {}
     combined_queries: dict = {}
@@ -94,19 +122,14 @@ def _build_combined_retrieval_task(tasks: list):
     for task in tasks:
         name = task.metadata.name
         print(f"  [로딩] {name}")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            task.load_data()
+        corpus, queries, qrels = _load_task_data(task)
 
-        avail = list(task.corpus.keys())
-        split = next((s for s in ("test", "dev", "validation") if s in avail), avail[0])
         prefix = name + "__"
-
-        for doc_id, doc in task.corpus[split].items():
+        for doc_id, doc in corpus.items():
             combined_corpus[prefix + doc_id] = doc
-        for q_id, q in task.queries[split].items():
+        for q_id, q in queries.items():
             combined_queries[prefix + q_id] = q
-        for q_id, rels in task.relevant_docs[split].items():
+        for q_id, rels in qrels.items():
             combined_qrels[prefix + q_id] = {
                 prefix + did: score for did, score in rels.items()
             }
@@ -123,8 +146,7 @@ def _build_combined_retrieval_task(tasks: list):
     combined.queries        = {"test": combined_queries}
     combined.relevant_docs  = {"test": combined_qrels}
     combined.data_loaded    = True
-    # MTEB가 evaluation.run() 내부에서 load_data()를 재호출하지 못하게 no-op으로 교체
-    combined.load_data = lambda **kwargs: None
+    combined.load_data      = lambda **kwargs: None
 
     try:
         combined.metadata = copy.copy(combined.metadata)
