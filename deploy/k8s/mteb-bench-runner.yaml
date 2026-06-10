@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mteb-model-cache
+  namespace: embedding
+  labels: { app: mteb-bench }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 5Gi }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mteb-datasets
+  namespace: embedding
+  labels: { app: mteb-bench }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 20Gi }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mteb-reports
+  namespace: embedding
+  labels: { app: mteb-bench }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 2Gi }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mteb-bench
+  namespace: embedding
+  labels: { app: mteb-bench }
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: { app: mteb-bench }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: abspxdevcr.azurecr.io/embedding-mteb:latest
+          command:
+            - python
+            - -m
+            - bench.mteb_runner
+            - --model
+            - sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+            - --task-types
+            - Retrieval
+            - --languages
+            - kor
+            - --out
+            - /reports
+            - --batch-size
+            - "32"
+          env:
+            - { name: HF_HOME, value: "/model-cache" }
+            - { name: HF_DATASETS_CACHE, value: "/datasets/.cache" }
+            - { name: OMP_NUM_THREADS, value: "2" }
+            - { name: MKL_NUM_THREADS, value: "2" }
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          resources:
+            requests: { cpu: "200m", memory: "1Gi" }
+            limits:   { cpu: "2", memory: "6Gi" }
+          volumeMounts:
+            - { name: model-cache, mountPath: /model-cache }
+            - { name: datasets,    mountPath: /datasets }
+            - { name: reports,     mountPath: /reports }
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim: { claimName: mteb-model-cache }
+        - name: datasets
+          persistentVolumeClaim: { claimName: mteb-datasets }
+        - name: reports
+          persistentVolumeClaim: { claimName: mteb-reports }

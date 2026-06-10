@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    HF_HOME=/model-cache \
+    HF_DATASETS_CACHE=/datasets/.cache \
+    TOKENIZERS_PARALLELISM=false \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+COPY deploy/requirements-mteb.txt /app/
+RUN pip install --no-cache-dir -r requirements-mteb.txt
+
+COPY bench /app/bench
+
+VOLUME ["/model-cache", "/datasets", "/reports"]
+
+CMD ["python", "-m", "bench.mteb_runner", "--out", "/reports"]

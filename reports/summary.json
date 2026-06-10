@@ -1,0 +1,82 @@
+﻿[
+    {
+        "model":  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "task":  "AutoRAGRetrieval",
+        "ndcg_at_10":  0.0,
+        "mrr_at_10":  0.0,
+        "recall_at_1":  0.0,
+        "recall_at_5":  0.0,
+        "recall_at_10":  0.0,
+        "map_at_10":  0.0
+    },
+    {
+        "model":  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "task":  "Ko-StrategyQA",
+        "ndcg_at_10":  0.00095,
+        "mrr_at_10":  0.000845,
+        "recall_at_1":  0.0,
+        "recall_at_5":  0.00084,
+        "recall_at_10":  0.00169,
+        "map_at_10":  0.00059
+    },
+    {
+        "model":  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "task":  "LawIRKo",
+        "ndcg_at_10":  0.00155,
+        "mrr_at_10":  0.001091,
+        "recall_at_1":  0.00056,
+        "recall_at_5":  0.0014,
+        "recall_at_10":  0.00337,
+        "map_at_10":  0.00103
+    },
+    {
+        "model":  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "task":  "MKQARetrieval",
+        "ndcg_at_10":  0.00048,
+        "mrr_at_10":  0.000317,
+        "recall_at_1":  0.00015,
+        "recall_at_5":  0.00037,
+        "recall_at_10":  0.00089,
+        "map_at_10":  0.0003
+    },
+    {
+        "model":  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "task":  "PublicHealthQA",
+        "ndcg_at_10":  0.06572,
+        "mrr_at_10":  0.04244,
+        "recall_at_1":  0.01299,
+        "recall_at_5":  0.09091,
+        "recall_at_10":  0.14286,
+        "map_at_10":  0.04244
+    },
+    {
+        "model":  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "task":  "SQuADKorV1Retrieval",
+        "ndcg_at_10":  0.01233,
+        "mrr_at_10":  0.009671,
+        "recall_at_1":  0.00537,
+        "recall_at_5":  0.01507,
+        "recall_at_10":  0.02113,
+        "map_at_10":  0.00964
+    },
+    {
+        "model":  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "task":  "VisualSTS17Eng",
+        "ndcg_at_10":  null,
+        "mrr_at_10":  null,
+        "recall_at_1":  null,
+        "recall_at_5":  null,
+        "recall_at_10":  null,
+        "map_at_10":  null
+    },
+    {
+        "model":  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "task":  "VisualSTS17Multilingual",
+        "ndcg_at_10":  null,
+        "mrr_at_10":  null,
+        "recall_at_1":  null,
+        "recall_at_5":  null,
+        "recall_at_10":  null,
+        "map_at_10":  null
+    }
+]

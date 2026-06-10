@@ -1,0 +1,19 @@
+FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    HF_HOME=/workspace/models \
+    HF_DATASETS_CACHE=/workspace/datasets/.cache \
+    TOKENIZERS_PARALLELISM=false
+
+WORKDIR /workspace/embedding_bench
+
+COPY deploy/requirements-mteb.txt ./
+RUN pip install --no-cache-dir -r requirements-mteb.txt
+
+COPY bench ./bench
+
+# RunPod 기본 실행: 4개 모델 전체, bf16, /workspace/reports 저장
+CMD ["python", "-m", "bench.mteb_runner", \
+     "--model-dtype", "auto", \
+     "--batch-size", "256", \
+     "--out", "/workspace/reports"]
