@@ -15,5 +15,5 @@ COPY bench ./bench
 # RunPod 기본 실행: 한국어 Retrieval 6개 태스크, combined corpus, /workspace/reports 저장
 CMD ["python", "-m", "bench.mteb_runner", \
      "--model-dtype", "auto", \
-     "--batch-size", "256", \
+     "--batch-size", "64", \
      "--out", "/workspace/reports"]
