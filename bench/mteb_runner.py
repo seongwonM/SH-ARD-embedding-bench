@@ -24,6 +24,8 @@ import sys
 import time
 import warnings
 
+import gc
+
 import numpy as np
 
 _DEFAULT_MODELS = [
@@ -219,6 +221,8 @@ def _evaluate_retrieval(
         for i, qid in enumerate(q_ids[start:end]):
             run[qid] = {corp_ids[j]: float(scores[i, j]) for j in top_idx[i]}
 
+    del corp_embs, q_embs
+
     # score>=1 인 항목만 relevant 로 처리 (MIRACL은 0점 hard negative 포함)
     binary_qrels = {
         qid: {did: 1 for did, s in rels.items() if s >= 1}
@@ -315,8 +319,8 @@ def main() -> None:
     )
     ap.add_argument("--out",          default="reports",
                     help="결과 저장 루트 경로")
-    ap.add_argument("--batch-size",   type=int, default=256,
-                    help="encode 배치 크기 (GPU: 256, CPU: 32)")
+    ap.add_argument("--batch-size",   type=int, default=32,
+                    help="encode 배치 크기 (GPU: 32~64, CPU: 16)")
     ap.add_argument("--model-dtype",  default="auto",
                     choices=["auto", "fp32", "fp16", "bf16"])
     args = ap.parse_args()
@@ -342,10 +346,16 @@ def main() -> None:
     all_results = []
     t0_total = time.time()
 
+    import torch
+
     for model_id in model_ids:
         result = _run_model(model_id, tasks, args.out, args.batch_size, args.model_dtype)
         if result:
             all_results.append(result)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"  [GPU] 캐시 해제 완료: {torch.cuda.memory_allocated()/1e9:.1f} GB 사용 중")
 
     def _json_default(obj):
         try:
