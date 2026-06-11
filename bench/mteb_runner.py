@@ -1,18 +1,18 @@
 """
 MTEB 기반 한국어 임베딩 벤치마크 러너.
 
+한국어 corpus + 한국어 쿼리 태스크 6개의 문서/쿼리를 전부 합쳐
+단일 combined corpus 에서 retrieval 평가를 수행한다.
+
 usage:
   # 단일 모델
   python -m bench.mteb_runner --model BAAI/bge-m3
 
   # 복수 모델 순차 실행 (RunPod 권장)
-  python -m bench.mteb_runner --models BAAI/bge-m3 Qwen/Qwen3-0.6B Qwen/Qwen3-4B Qwen/Qwen3-8B
+  python -m bench.mteb_runner --models BAAI/bge-m3 Qwen/Qwen3-0.6B
 
-  # 태스크 타입 필터
-  python -m bench.mteb_runner --models BAAI/bge-m3 --task-types Retrieval
-
-  # 단일 태스크 테스트
-  python -m bench.mteb_runner --model BAAI/bge-m3 --tasks Ko-StrategyQA --batch-size 32
+  # 특정 태스크만 (MIRACL 제외 등)
+  python -m bench.mteb_runner --model BAAI/bge-m3 --tasks AutoRAGRetrieval Ko-StrategyQA
 """
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ import math
 import os
 import sys
 import time
+import warnings
 
+import numpy as np
 
 _DEFAULT_MODELS = [
     "BAAI/bge-m3",
@@ -31,106 +33,123 @@ _DEFAULT_MODELS = [
     "Qwen/Qwen3-8B",
 ]
 
-
-def _print_tasks(tasks) -> None:
-    by_type: dict[str, list] = {}
-    for t in tasks:
-        tp = t.metadata.type
-        by_type.setdefault(tp, []).append(t.metadata.name)
-    for tp, names in sorted(by_type.items()):
-        print(f"  [{tp}] {', '.join(names)}")
-
-
-def _extract_metrics(res) -> tuple[dict, dict]:
-    """
-    반환: (key_metrics, raw_scores)
-      key_metrics — NDCG@10·MRR@10·Recall@1/5/10 평균값 (보기 쉬운 요약)
-      raw_scores  — res.scores 원본 전체 (split → list of score dicts)
-    다중 언어 태스크는 key_metrics만 평균 처리, raw_scores는 있는 그대로 유지.
-    """
-    raw_scores = res.scores  # 원본 그대로
-
-    if not res.scores:
-        return {}, raw_scores
-
-    flat: list[dict] = []
-    for split_scores in res.scores.values():
-        for score in split_scores:
-            if not isinstance(score, dict):
-                continue
-            if "ndcg_at_10" in score:
-                flat.append(score)
-            else:
-                for v in score.values():
-                    if isinstance(v, dict) and "ndcg_at_10" in v:
-                        flat.append(v)
-
-    target = ["ndcg_at_10", "mrr_at_10", "recall_at_1", "recall_at_5", "recall_at_10", "map_at_10"]
-    key_metrics: dict = {}
-    for k in target:
-        vals = [m[k] for m in flat if k in m and m[k] is not None]
-        if vals:
-            key_metrics[k] = round(sum(vals) / len(vals), 4)
-
-    return key_metrics, raw_scores
-
+# 한국어 corpus + 한국어 쿼리 태스크
+_KO_RETRIEVAL_TASKS = [
+    "AutoRAGRetrieval",
+    "Ko-StrategyQA",
+    "LawIRKo",
+    "SQuADKorV1Retrieval",
+    "PublicHealthQA",
+    "MIRACLRetrieval",   # 한국어 Wikipedia corpus (1.5M docs) + 한국어 쿼리
+]
 
 _DTYPE_MAP = {"auto": "auto", "fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 데이터 로딩
+# ──────────────────────────────────────────────────────────────────────────────
+
 def _load_task_data(task) -> tuple[dict, dict, dict]:
     """
-    HF datasets에서 직접 corpus/queries/qrels를 로드해 dict로 반환.
-    MTEB 1.34+에서 load_data()가 self.corpus를 설정하지 않으므로 직접 로드.
+    MTEB 2.15 새 포맷 / 구 포맷 모두 지원.
+
+    새 포맷 (대부분의 태스크):
+      task.dataset[config][split] = {
+        'corpus':        HF Dataset (id, text, title)
+        'queries':       HF Dataset (id, text)
+        'relevant_docs': dict {qid: {did: score}}
+      }
+
+    구 포맷 (PublicHealthQA):
+      task.corpus[lang][split]  = {id: {text, title, ...}}
+      task.queries[lang][split] = {id: text}
+      task.relevant_docs[lang][split] = {qid: {did: score}}
+
+    반환: corpus={id: {title, text}}, queries={id: text}, qrels={qid: {did: score}}
     """
-    from datasets import load_dataset
+    split = task.metadata.eval_splits[0]
 
-    meta     = task.metadata
-    path     = meta.dataset["path"]
-    revision = meta.dataset.get("revision")
-    split    = next((s for s in ("test", "dev") if s in meta.eval_splits), meta.eval_splits[0])
+    # data_loaded 강제 리셋 (MTEB 2.15 에서 초기값이 True인 경우 대비)
+    try:
+        task._data_loaded = False
+    except Exception:
+        pass
 
-    hf_kw: dict = {"trust_remote_code": True}
-    if revision:
-        hf_kw["revision"] = revision
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            task.load_data(eval_splits=[split])
+        except TypeError:
+            task.load_data()
 
-    corpus_ds  = load_dataset(path, "corpus",  split="corpus",  **hf_kw)
-    queries_ds = load_dataset(path, "queries", split="queries", **hf_kw)
-    qrels_ds   = load_dataset(path, "qrels",   split=split,     **hf_kw)
+    # ── 새 포맷 ──────────────────────────────────────────────────────────────
+    ds = getattr(task, "dataset", None)
+    if ds is not None and hasattr(ds, "keys"):
+        config   = list(ds.keys())[0]
+        cfg_data = ds[config]
+        inner    = cfg_data.get(split, {}) if hasattr(cfg_data, "get") else cfg_data[split]
 
-    corpus = {r["_id"]: {"title": r.get("title", ""), "text": r["text"]} for r in corpus_ds}
-    queries = {r["_id"]: r["text"] for r in queries_ds}
-    qrels: dict = {}
-    for r in qrels_ds:
-        qrels.setdefault(r["query-id"], {})[r["corpus-id"]] = int(r.get("score", 1))
+        if isinstance(inner, dict) and "corpus" in inner:
+            corpus_ds  = inner["corpus"]
+            queries_ds = inner["queries"]
+            qrels_raw  = inner.get("relevant_docs", {})
 
-    return corpus, queries, qrels
+            corpus  = {r["id"]: {"title": r.get("title", ""), "text": r["text"]}
+                       for r in corpus_ds}
+            queries = {r["id"]: r["text"] for r in queries_ds}
+            qrels   = dict(qrels_raw) if qrels_raw else {}
+            return corpus, queries, qrels
+
+    # ── 구 포맷 ──────────────────────────────────────────────────────────────
+    corpus_attr = getattr(task, "corpus", None)
+    if corpus_attr:
+        lang_key  = list(corpus_attr.keys())[0]
+        split_map = corpus_attr[lang_key]
+        split_key = split if split in split_map else list(split_map.keys())[0]
+
+        corpus_raw = split_map[split_key]
+        corpus = (corpus_raw if isinstance(corpus_raw, dict)
+                  else {r["_id"]: {"title": r.get("title", ""), "text": r["text"]}
+                        for r in corpus_raw})
+
+        queries_raw = (getattr(task, "queries", {}) or {}).get(lang_key, {}).get(split_key, {})
+        queries = (queries_raw if isinstance(queries_raw, dict)
+                   else {r["_id"]: r["text"] for r in queries_raw})
+
+        qrels = ((getattr(task, "relevant_docs", {}) or {})
+                 .get(lang_key, {}).get(split_key, {})) or {}
+
+        return corpus, queries, qrels
+
+    raise ValueError(f"{task.metadata.name}: 데이터 로드 실패")
 
 
-def _build_combined_retrieval_task(tasks: list):
+# ──────────────────────────────────────────────────────────────────────────────
+# Combined corpus 구축
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_combined_corpus(tasks: list) -> tuple[dict, dict, dict]:
     """
-    여러 Retrieval 태스크의 corpus/queries/qrels를 합쳐서 단일 태스크 객체 반환.
-    doc_id/query_id 충돌 방지를 위해 "<태스크명>__<원본id>" 형태로 prefix 부여.
+    모든 태스크의 corpus/queries/qrels를 '<태스크명>__' 접두어로 합산.
+    반환: combined_corpus, combined_queries, combined_qrels
     """
-    import copy
-    import dataclasses
-
-    combined_corpus: dict = {}
+    combined_corpus:  dict = {}
     combined_queries: dict = {}
-    combined_qrels: dict = {}
+    combined_qrels:   dict = {}
 
     for task in tasks:
-        name = task.metadata.name
+        name   = task.metadata.name
+        prefix = name + "__"
         print(f"  [로딩] {name}")
         corpus, queries, qrels = _load_task_data(task)
 
-        prefix = name + "__"
-        for doc_id, doc in corpus.items():
-            combined_corpus[prefix + doc_id] = doc
-        for q_id, q in queries.items():
-            combined_queries[prefix + q_id] = q
-        for q_id, rels in qrels.items():
-            combined_qrels[prefix + q_id] = {
+        for did, doc in corpus.items():
+            combined_corpus[prefix + did] = doc
+        for qid, text in queries.items():
+            combined_queries[prefix + qid] = text
+        for qid, rels in qrels.items():
+            combined_qrels[prefix + qid] = {
                 prefix + did: score for did, score in rels.items()
             }
 
@@ -139,28 +158,106 @@ def _build_combined_retrieval_task(tasks: list):
         f"queries {len(combined_queries):,}건 · "
         f"qrel pairs {sum(len(v) for v in combined_qrels.values()):,}건"
     )
-
-    # 첫 번째 태스크를 template으로 shallow copy 후 데이터 교체
-    combined = copy.copy(tasks[0])
-    combined.corpus         = {"test": combined_corpus}
-    combined.queries        = {"test": combined_queries}
-    combined.relevant_docs  = {"test": combined_qrels}
-    combined.data_loaded    = True
-    combined.load_data      = lambda **kwargs: None
-
-    try:
-        combined.metadata = copy.copy(combined.metadata)
-        combined.metadata.name = "CombinedKoreanRetrieval"
-    except (AttributeError, TypeError, dataclasses.FrozenInstanceError):
-        pass
-
-    return combined
+    return combined_corpus, combined_queries, combined_qrels
 
 
-def _run_model(model_id: str, tasks: list, out_dir: str, batch_size: int, model_dtype: str = "auto") -> list[dict]:
-    """단일 모델 평가 실행. summary 리스트 반환."""
+# ──────────────────────────────────────────────────────────────────────────────
+# Retrieval 평가
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _encode(model, texts: list[str], batch_size: int, show_progress: bool = True) -> np.ndarray:
+    """
+    모델 encode 후 L2 정규화.
+    MTEB 2.15 SentenceTransformerEncoderWrapper (task_metadata/hf_split/hf_subset 필수)
+    와 일반 SentenceTransformer 모두 지원.
+    """
+    kw = {"batch_size": batch_size, "show_progress_bar": show_progress}
+    # MTEB 2.15 SentenceTransformerEncoderWrapper는 task_metadata 필수라 우회.
+    # .model 속성으로 내부 SentenceTransformer에 직접 위임.
+    inner = getattr(model, "model", model)
+    embs = inner.encode(texts, **kw)
+    embs = np.array(embs)
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    return embs / np.maximum(norms, 1e-9)
+
+
+def _evaluate_retrieval(
+    model,
+    corpus:  dict,
+    queries: dict,
+    qrels:   dict,
+    batch_size: int,
+    top_k: int = 100,
+) -> dict:
+    """
+    corpus 전체 인코딩 → query별 top-k cosine similarity → pytrec_eval 지표 계산.
+    반환: {ndcg_at_10, mrr_at_10, recall_at_1, recall_at_5, recall_at_10, map_at_10}
+    """
+    import pytrec_eval
+
+    # corpus 인코딩
+    corp_ids   = list(corpus.keys())
+    corp_texts = [f"{corpus[d].get('title', '')} {corpus[d]['text']}".strip()
+                  for d in corp_ids]
+    print(f"  corpus 인코딩 ({len(corp_ids):,}건)...")
+    corp_embs = _encode(model, corp_texts, batch_size, show_progress=True)
+
+    # query 인코딩
+    q_ids   = list(queries.keys())
+    q_texts = [queries[qid] for qid in q_ids]
+    print(f"  query 인코딩 ({len(q_ids):,}건)...")
+    q_embs = _encode(model, q_texts, batch_size, show_progress=False)
+
+    # top-k 검색 (query chunk 단위로 처리해 메모리 절약)
+    print(f"  top-{top_k} 검색 ({len(q_ids):,} queries × {len(corp_ids):,} docs)...")
+    chunk = 256
+    run: dict = {}
+    for start in range(0, len(q_ids), chunk):
+        end    = min(start + chunk, len(q_ids))
+        scores = np.dot(q_embs[start:end], corp_embs.T)              # (chunk, N_corp)
+        top_idx = np.argpartition(scores, -top_k, axis=1)[:, -top_k:]
+        for i, qid in enumerate(q_ids[start:end]):
+            run[qid] = {corp_ids[j]: float(scores[i, j]) for j in top_idx[i]}
+
+    # score>=1 인 항목만 relevant 로 처리 (MIRACL은 0점 hard negative 포함)
+    binary_qrels = {
+        qid: {did: 1 for did, s in rels.items() if s >= 1}
+        for qid, rels in qrels.items()
+        if any(s >= 1 for s in rels.values())
+    }
+
+    evaluator = pytrec_eval.RelevanceEvaluator(
+        binary_qrels,
+        {"ndcg_cut.10", "recip_rank", "recall.1", "recall.5", "recall.10", "map_cut.10"},
+    )
+    per_query = evaluator.evaluate(run)
+
+    def _avg(key: str) -> float | None:
+        vals = [v.get(key, 0.0) for v in per_query.values()]
+        return round(sum(vals) / len(vals), 4) if vals else None
+
+    return {
+        "ndcg_at_10":   _avg("ndcg_cut_10"),
+        "mrr_at_10":    _avg("recip_rank"),
+        "recall_at_1":  _avg("recall_1"),
+        "recall_at_5":  _avg("recall_5"),
+        "recall_at_10": _avg("recall_10"),
+        "map_at_10":    _avg("map_cut_10"),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 모델별 실행
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_model(
+    model_id: str,
+    tasks: list,
+    out_dir: str,
+    batch_size: int,
+    model_dtype: str = "auto",
+) -> dict:
     import mteb
-    import warnings
 
     print(f"\n{'='*64}")
     print(f"  모델: {model_id}  (dtype={model_dtype})")
@@ -169,82 +266,59 @@ def _run_model(model_id: str, tasks: list, out_dir: str, batch_size: int, model_
     try:
         model = mteb.get_model(model_id, model_kwargs={"torch_dtype": _DTYPE_MAP[model_dtype]})
     except TypeError:
-        # 구버전 MTEB: model_kwargs 미지원
         model = mteb.get_model(model_id)
     except Exception as e:
         print(f"[ERROR] 모델 로드 실패: {e}")
-        return []
+        return {}
 
-    # 모든 태스크가 Retrieval이면 corpus를 합쳐서 단일 평가
-    all_retrieval = all(t.metadata.type == "Retrieval" for t in tasks)
-    if all_retrieval and len(tasks) > 1:
-        print(f"\n[합산 모드] {len(tasks)}개 Retrieval 태스크 corpus 병합 중...")
-        eval_tasks = [_build_combined_retrieval_task(tasks)]
-    else:
-        eval_tasks = tasks
+    print(f"\n[corpus 병합] {len(tasks)}개 태스크...")
+    t0_merge = time.time()
+    combined_corpus, combined_queries, combined_qrels = _build_combined_corpus(tasks)
+    print(f"  병합 완료 ({time.time() - t0_merge:.0f}s)")
 
-    summary = []
-    t0_model = time.time()
+    t0_eval = time.time()
+    metrics = _evaluate_retrieval(
+        model, combined_corpus, combined_queries, combined_qrels, batch_size
+    )
+    elapsed = time.time() - t0_eval
 
-    for task in eval_tasks:
-        t0 = time.time()
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                evaluation = mteb.MTEB(tasks=[task])
-            results = evaluation.run(
-                model,
-                output_folder=out_dir,
-                encode_kwargs={"batch_size": batch_size},
-            )
-            for res in results:
-                m, raw = _extract_metrics(res)
-                elapsed = time.time() - t0
-                print(
-                    f"  {res.task_name}: "
-                    f"NDCG@10={m.get('ndcg_at_10')}  "
-                    f"MRR@10={m.get('mrr_at_10')}  "
-                    f"Recall@1={m.get('recall_at_1')}  "
-                    f"Recall@10={m.get('recall_at_10')}  "
-                    f"({elapsed:.0f}s)"
-                )
-                summary.append({
-                    "model":        model_id,
-                    "task":         res.task_name,
-                    "ndcg_at_10":  m.get("ndcg_at_10"),
-                    "mrr_at_10":   m.get("mrr_at_10"),
-                    "recall_at_1": m.get("recall_at_1"),
-                    "recall_at_5": m.get("recall_at_5"),
-                    "recall_at_10":m.get("recall_at_10"),
-                    "map_at_10":   m.get("map_at_10"),
-                    "raw_scores":  raw,
-                })
-        except Exception as e:
-            print(f"  [SKIP] {task.metadata.name}: {e}")
+    print(
+        f"\n  NDCG@10={metrics.get('ndcg_at_10')}  "
+        f"MRR@10={metrics.get('mrr_at_10')}  "
+        f"Recall@10={metrics.get('recall_at_10')}  "
+        f"({elapsed:.0f}s)"
+    )
 
-    total = time.time() - t0_model
-    print(f"\n  → {len(summary)}개 완료 ({total:.0f}s)")
-    return summary
+    return {
+        "model":  model_id,
+        "task":   "CombinedKoreanRetrieval",
+        "tasks":  [t.metadata.name for t in tasks],
+        **metrics,
+    }
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="MTEB 한국어 벤치마크")
+    ap = argparse.ArgumentParser(description="MTEB 한국어 벤치마크 (combined corpus)")
     model_group = ap.add_mutually_exclusive_group()
     model_group.add_argument("--model",  help="단일 모델 HuggingFace ID")
     model_group.add_argument(
         "--models", nargs="+",
         help=f"복수 모델 순차 실행 (기본: {' '.join(_DEFAULT_MODELS)})",
     )
-    ap.add_argument("--tasks",      nargs="*", help="특정 태스크 이름 목록")
-    ap.add_argument("--task-types", nargs="*", help="태스크 타입 필터 (Retrieval 등)")
-    ap.add_argument("--languages",  nargs="*", default=["kor"], help="언어 필터, 기본 kor")
-    ap.add_argument("--out",        default="reports",
-                    help="결과 저장 루트 경로 (RunPod: /workspace/reports  k8s: /reports)")
-    ap.add_argument("--batch-size", type=int, default=256,
-                    help="encode 배치 크기 (GPU 기본: 256 / CPU 검증: 32)")
-    ap.add_argument("--model-dtype", default="auto",
-                    choices=["auto", "fp32", "fp16", "bf16"],
-                    help="모델 로드 dtype. auto=모델 기본값(GPU권장), fp32=CPU 안전")
+    ap.add_argument(
+        "--tasks", nargs="*", default=_KO_RETRIEVAL_TASKS,
+        help="평가 태스크 목록 (기본: 한국어 6개)",
+    )
+    ap.add_argument("--out",          default="reports",
+                    help="결과 저장 루트 경로")
+    ap.add_argument("--batch-size",   type=int, default=256,
+                    help="encode 배치 크기 (GPU: 256, CPU: 32)")
+    ap.add_argument("--model-dtype",  default="auto",
+                    choices=["auto", "fp32", "fp16", "bf16"])
     args = ap.parse_args()
 
     try:
@@ -254,38 +328,25 @@ def main() -> None:
 
     os.makedirs(args.out, exist_ok=True)
 
-    # 모델 목록 결정
-    if args.model:
-        model_ids = [args.model]
-    elif args.models:
-        model_ids = args.models
-    else:
-        model_ids = _DEFAULT_MODELS
+    model_ids = [args.model] if args.model else (args.models or _DEFAULT_MODELS)
 
-    # 태스크 목록 (모든 모델 공통)
-    kwargs: dict = dict(
-        languages=args.languages,
+    tasks = mteb.get_tasks(
+        tasks=args.tasks,
+        languages=["kor"],
         modalities=["text"],
         exclusive_modality_filter=True,
     )
-    if args.tasks:
-        kwargs["tasks"] = args.tasks
-    if args.task_types:
-        kwargs["task_types"] = args.task_types
-    tasks = mteb.get_tasks(**kwargs)
+    print(f"[태스크] {len(tasks)}개: {[t.metadata.name for t in tasks]}")
+    print(f"[모델]   {len(model_ids)}개: {', '.join(model_ids)}")
 
-    print(f"[태스크] {len(tasks)}개:")
-    _print_tasks(tasks)
-    print(f"\n[모델] {len(model_ids)}개: {', '.join(model_ids)}")
-
-    all_summary = []
+    all_results = []
     t0_total = time.time()
 
     for model_id in model_ids:
-        results = _run_model(model_id, tasks, args.out, args.batch_size, args.model_dtype)
-        all_summary.extend(results)
+        result = _run_model(model_id, tasks, args.out, args.batch_size, args.model_dtype)
+        if result:
+            all_results.append(result)
 
-    # 통합 summary 저장 (numpy float64 / NaN → Python float 변환)
     def _json_default(obj):
         try:
             f = float(obj)
@@ -295,11 +356,11 @@ def main() -> None:
 
     summary_path = os.path.join(args.out, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(all_summary, f, ensure_ascii=False, indent=2, default=_json_default)
+        json.dump(all_results, f, ensure_ascii=False, indent=2, default=_json_default)
 
     total = time.time() - t0_total
-    print(f"\n\n{'='*64}")
-    print(f"  전체 완료: {len(all_summary)}개 결과  ({total:.0f}s)")
+    print(f"\n{'='*64}")
+    print(f"  전체 완료: {len(all_results)}개 모델  ({total:.0f}s)")
     print(f"  저장: {summary_path}")
     print(f"{'='*64}")
 

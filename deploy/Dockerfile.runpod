@@ -12,9 +12,8 @@ RUN pip install --no-cache-dir -r requirements-mteb.txt
 
 COPY bench ./bench
 
-# RunPod 기본 실행: 4개 모델 전체, bf16, /workspace/reports 저장
+# RunPod 기본 실행: 한국어 Retrieval 6개 태스크, combined corpus, /workspace/reports 저장
 CMD ["python", "-m", "bench.mteb_runner", \
-     "--task-types", "Retrieval", \
      "--model-dtype", "auto", \
      "--batch-size", "256", \
      "--out", "/workspace/reports"]
