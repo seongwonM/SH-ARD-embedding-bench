@@ -17,14 +17,13 @@ usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
 import sys
 import time
 import warnings
-
-import gc
 
 import numpy as np
 
@@ -35,14 +34,13 @@ _DEFAULT_MODELS = [
     "Qwen/Qwen3-8B",
 ]
 
-# 한국어 corpus + 한국어 쿼리 태스크
 _KO_RETRIEVAL_TASKS = [
     "AutoRAGRetrieval",
     "Ko-StrategyQA",
     "LawIRKo",
     "SQuADKorV1Retrieval",
     "PublicHealthQA",
-    "MIRACLRetrieval",   # 한국어 Wikipedia corpus (1.5M docs) + 한국어 쿼리
+    "MIRACLRetrieval",
 ]
 
 _DTYPE_MAP = {"auto": "auto", "fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
@@ -57,20 +55,18 @@ def _mem(label: str = "") -> None:
     parts = []
     try:
         import psutil
-        rss_gb = psutil.Process().memory_info().rss / 1e9
-        parts.append(f"CPU RSS={rss_gb:.2f}GB")
+        parts.append(f"CPU RSS={psutil.Process().memory_info().rss / 1e9:.2f}GB")
     except ImportError:
         pass
-
     try:
         import torch
         if torch.cuda.is_available():
-            alloc_gb  = torch.cuda.memory_allocated() / 1e9
-            reserv_gb = torch.cuda.memory_reserved() / 1e9
-            parts.append(f"GPU alloc={alloc_gb:.2f}GB reserved={reserv_gb:.2f}GB")
+            parts.append(
+                f"GPU alloc={torch.cuda.memory_allocated()/1e9:.2f}GB "
+                f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB"
+            )
     except ImportError:
         pass
-
     tag = f"[MEM] {label}: " if label else "[MEM] "
     print(tag + ("  ".join(parts) if parts else "(psutil/torch 없음)"), flush=True)
 
@@ -82,31 +78,16 @@ def _mem(label: str = "") -> None:
 def _load_task_data(task) -> tuple[dict, dict, dict]:
     """
     MTEB 2.15 새 포맷 / 구 포맷 모두 지원.
-
-    새 포맷 (대부분의 태스크):
-      task.dataset[config][split] = {
-        'corpus':        HF Dataset (id, text, title)
-        'queries':       HF Dataset (id, text)
-        'relevant_docs': dict {qid: {did: score}}
-      }
-
-    구 포맷 (PublicHealthQA):
-      task.corpus[lang][split]  = {id: {text, title, ...}}
-      task.queries[lang][split] = {id: text}
-      task.relevant_docs[lang][split] = {qid: {did: score}}
-
     반환: corpus={id: {title, text}}, queries={id: text}, qrels={qid: {did: score}}
     """
     split = task.metadata.eval_splits[0]
 
-    # data_loaded 강제 리셋 (MTEB 2.15 에서 초기값이 True인 경우 대비)
     before = getattr(task, "_data_loaded", "attr-missing")
     try:
         task._data_loaded = False
     except Exception:
         pass
-    after = getattr(task, "_data_loaded", "attr-missing")
-    print(f"    [_data_loaded] {task.metadata.name}: {before} → {after}", flush=True)
+    print(f"    [_data_loaded] {task.metadata.name}: {before} → {getattr(task, '_data_loaded', '?')}", flush=True)
 
     _mem(f"load_data 전 ({task.metadata.name})")
     with warnings.catch_warnings():
@@ -117,26 +98,21 @@ def _load_task_data(task) -> tuple[dict, dict, dict]:
             task.load_data()
     _mem(f"load_data 후 ({task.metadata.name})")
 
-    # ── 새 포맷 ──────────────────────────────────────────────────────────────
+    # ── 새 포맷 (MTEB 2.15+) ─────────────────────────────────────────────────
     ds = getattr(task, "dataset", None)
     if ds is not None and hasattr(ds, "keys"):
         config   = list(ds.keys())[0]
         cfg_data = ds[config]
         inner    = cfg_data.get(split, {}) if hasattr(cfg_data, "get") else cfg_data[split]
-
         if isinstance(inner, dict) and "corpus" in inner:
-            corpus_ds  = inner["corpus"]
-            queries_ds = inner["queries"]
-            qrels_raw  = inner.get("relevant_docs", {})
-
             corpus  = {r["id"]: {"title": r.get("title", ""), "text": r["text"]}
-                       for r in corpus_ds}
-            queries = {r["id"]: r["text"] for r in queries_ds}
-            qrels   = dict(qrels_raw) if qrels_raw else {}
+                       for r in inner["corpus"]}
+            queries = {r["id"]: r["text"] for r in inner["queries"]}
+            qrels   = dict(inner.get("relevant_docs", {}))
             print(f"    [새포맷] corpus={len(corpus):,}  queries={len(queries):,}  qrels={len(qrels):,}", flush=True)
             return corpus, queries, qrels
 
-    # ── 구 포맷 ──────────────────────────────────────────────────────────────
+    # ── 구 포맷 (BEIR — PublicHealthQA) ──────────────────────────────────────
     corpus_attr = getattr(task, "corpus", None)
     if corpus_attr:
         lang_key  = list(corpus_attr.keys())[0]
@@ -161,14 +137,10 @@ def _load_task_data(task) -> tuple[dict, dict, dict]:
     raise ValueError(f"{task.metadata.name}: 데이터 로드 실패")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Combined corpus 구축
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _build_combined_corpus(tasks: list) -> tuple[dict, dict, dict]:
+def _build_combined_corpus(tasks: list) -> tuple[dict, dict, dict, list[str]]:
     """
     모든 태스크의 corpus/queries/qrels를 '<태스크명>__' 접두어로 합산.
-    반환: combined_corpus, combined_queries, combined_qrels
+    반환: combined_corpus, combined_queries, combined_qrels, task_names
     """
     combined_corpus:  dict = {}
     combined_queries: dict = {}
@@ -186,9 +158,7 @@ def _build_combined_corpus(tasks: list) -> tuple[dict, dict, dict]:
         for qid, text in queries.items():
             combined_queries[prefix + qid] = text
         for qid, rels in qrels.items():
-            combined_qrels[prefix + qid] = {
-                prefix + did: score for did, score in rels.items()
-            }
+            combined_qrels[prefix + qid] = {prefix + did: score for did, score in rels.items()}
 
         _mem(f"병합 후 ({name}, 누적 corpus={len(combined_corpus):,})")
 
@@ -199,22 +169,21 @@ def _build_combined_corpus(tasks: list) -> tuple[dict, dict, dict]:
         flush=True,
     )
     _mem("_build_combined_corpus 완료")
-    return combined_corpus, combined_queries, combined_qrels
+    return combined_corpus, combined_queries, combined_qrels, [t.metadata.name for t in tasks]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Retrieval 평가
+# 인코딩
 # ──────────────────────────────────────────────────────────────────────────────
 
-_ENCODE_CHUNK = 50_000  # sentence-transformers가 내부 numpy 배열을 미리 통째로 할당하는 현상 방지
+_ENCODE_CHUNK = 50_000  # sentence-transformers 선(先)할당 OOM 방지용 청크 크기
 
 
 def _encode(model, texts: list[str], batch_size: int, show_progress: bool = True) -> np.ndarray:
     """
     모델 encode 후 L2 정규화.
-    texts 수가 _ENCODE_CHUNK 초과 시 청크 단위로 나눠 인코딩해
-    sentence-transformers의 전체 길이 기반 numpy 선(先)할당 OOM 방지.
-    MTEB 2.15 SentenceTransformerEncoderWrapper는 .model로 직접 위임.
+    texts 수가 _ENCODE_CHUNK 초과 시 청크 단위로 나눠 인코딩.
+    청크 간 cuda.empty_cache() 호출로 GPU reserved pool 조각화 방지.
     """
     inner = getattr(model, "model", model)
     kw = {"batch_size": batch_size, "show_progress_bar": show_progress}
@@ -222,6 +191,7 @@ def _encode(model, texts: list[str], batch_size: int, show_progress: bool = True
     if len(texts) <= _ENCODE_CHUNK:
         embs = np.array(inner.encode(texts, **kw))
     else:
+        import torch as _torch
         chunks = []
         n_chunks = math.ceil(len(texts) / _ENCODE_CHUNK)
         for ci in range(n_chunks):
@@ -230,6 +200,8 @@ def _encode(model, texts: list[str], batch_size: int, show_progress: bool = True
             chunks.append(np.array(inner.encode(texts[s:e], **kw)))
             _mem(f"    chunk {ci+1}/{n_chunks} 완료")
             gc.collect()
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()  # reserved pool 반환 — gc만으론 CUDA 메모리 미해제
         embs = np.concatenate(chunks, axis=0)
         del chunks
         gc.collect()
@@ -237,6 +209,10 @@ def _encode(model, texts: list[str], batch_size: int, show_progress: bool = True
     norms = np.linalg.norm(embs, axis=1, keepdims=True)
     return embs / np.maximum(norms, 1e-9)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Retrieval 평가
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _evaluate_retrieval(
     model,
@@ -256,10 +232,8 @@ def _evaluate_retrieval(
     _mem("_evaluate_retrieval 진입")
     corp_bs = corpus_batch_size if corpus_batch_size is not None else batch_size
 
-    # corpus 인코딩
     corp_ids   = list(corpus.keys())
-    corp_texts = [f"{corpus[d].get('title', '')} {corpus[d]['text']}".strip()
-                  for d in corp_ids]
+    corp_texts = [f"{corpus[d].get('title', '')} {corpus[d]['text']}".strip() for d in corp_ids]
     print(f"  corpus 인코딩 ({len(corp_ids):,}건, batch={corp_bs})...", flush=True)
     _mem("corpus encode 전")
     corp_embs = _encode(model, corp_texts, corp_bs, show_progress=True)
@@ -267,9 +241,8 @@ def _evaluate_retrieval(
           f"size={corp_embs.nbytes/1e9:.3f}GB", flush=True)
     del corp_texts
     gc.collect()
-    _mem("corpus encode 후 (corp_texts 해제)")
+    _mem("corpus encode 후")
 
-    # query 인코딩
     q_ids   = list(queries.keys())
     q_texts = [queries[qid] for qid in q_ids]
     print(f"  query 인코딩 ({len(q_ids):,}건, batch={batch_size})...", flush=True)
@@ -277,16 +250,14 @@ def _evaluate_retrieval(
     q_embs = _encode(model, q_texts, batch_size, show_progress=False)
     del q_texts
     gc.collect()
-    _mem("query encode 후 (q_texts 해제)")
+    _mem("query encode 후")
 
-    # top-k 검색 (query chunk 단위로 처리해 메모리 절약)
     print(f"  top-{top_k} 검색 ({len(q_ids):,} queries × {len(corp_ids):,} docs)...", flush=True)
     _mem("top-k 검색 전")
-    chunk = 256
     run: dict = {}
-    for start in range(0, len(q_ids), chunk):
-        end    = min(start + chunk, len(q_ids))
-        scores = np.dot(q_embs[start:end], corp_embs.T)              # (chunk, N_corp)
+    for start in range(0, len(q_ids), 256):
+        end    = min(start + 256, len(q_ids))
+        scores = np.dot(q_embs[start:end], corp_embs.T)
         top_idx = np.argpartition(scores, -top_k, axis=1)[:, -top_k:]
         for i, qid in enumerate(q_ids[start:end]):
             run[qid] = {corp_ids[j]: float(scores[i, j]) for j in top_idx[i]}
@@ -294,15 +265,13 @@ def _evaluate_retrieval(
 
     del corp_embs, q_embs
     gc.collect()
-    _mem("top-k 검색 후 (embs 해제)")
+    _mem("top-k 검색 후")
 
-    # score>=1 인 항목만 relevant 로 처리 (MIRACL은 0점 hard negative 포함)
     binary_qrels = {
         qid: {did: 1 for did, s in rels.items() if s >= 1}
         for qid, rels in qrels.items()
         if any(s >= 1 for s in rels.values())
     }
-
     evaluator = pytrec_eval.RelevanceEvaluator(
         binary_qrels,
         {"ndcg_cut.10", "recip_rank", "recall.1", "recall.5", "recall.10", "map_cut.10"},
@@ -310,7 +279,7 @@ def _evaluate_retrieval(
     per_query = evaluator.evaluate(run)
     del run, binary_qrels
     gc.collect()
-    _mem("pytrec_eval 완료 (run 해제)")
+    _mem("pytrec_eval 완료")
 
     def _avg(key: str) -> float | None:
         vals = [v.get(key, 0.0) for v in per_query.values()]
@@ -332,8 +301,10 @@ def _evaluate_retrieval(
 
 def _run_model(
     model_id: str,
-    tasks: list,
-    out_dir: str,
+    combined_corpus:  dict,
+    combined_queries: dict,
+    combined_qrels:   dict,
+    task_names: list[str],
     batch_size: int,
     corpus_batch_size: int | None = None,
     model_dtype: str = "auto",
@@ -354,23 +325,12 @@ def _run_model(
         return {}
     _mem("모델 로드 후")
 
-    print(f"\n[corpus 병합] {len(tasks)}개 태스크...", flush=True)
-    t0_merge = time.time()
-    combined_corpus, combined_queries, combined_qrels = _build_combined_corpus(tasks)
-    print(f"  병합 완료 ({time.time() - t0_merge:.0f}s)", flush=True)
-    _mem("corpus 병합 완료")
-
-    t0_eval = time.time()
+    t0 = time.time()
     metrics = _evaluate_retrieval(
         model, combined_corpus, combined_queries, combined_qrels,
         batch_size, corpus_batch_size,
     )
-    elapsed = time.time() - t0_eval
-
-    # 평가 완료 후 대형 데이터 구조 명시적 해제
-    del combined_corpus, combined_queries, combined_qrels
-    gc.collect()
-    _mem("combined corpus 해제 후")
+    elapsed = time.time() - t0
 
     print(
         f"\n  NDCG@10={metrics.get('ndcg_at_10')}  "
@@ -382,7 +342,7 @@ def _run_model(
     return {
         "model":  model_id,
         "task":   "CombinedKoreanRetrieval",
-        "tasks":  [t.metadata.name for t in tasks],
+        "tasks":  task_names,
         **metrics,
     }
 
@@ -395,22 +355,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="MTEB 한국어 벤치마크 (combined corpus)")
     model_group = ap.add_mutually_exclusive_group()
     model_group.add_argument("--model",  help="단일 모델 HuggingFace ID")
-    model_group.add_argument(
-        "--models", nargs="+",
-        help=f"복수 모델 순차 실행 (기본: {' '.join(_DEFAULT_MODELS)})",
-    )
-    ap.add_argument(
-        "--tasks", nargs="*", default=_KO_RETRIEVAL_TASKS,
-        help="평가 태스크 목록 (기본: 한국어 6개)",
-    )
-    ap.add_argument("--out",          default="reports",
-                    help="결과 저장 루트 경로")
+    model_group.add_argument("--models", nargs="+",
+                             help=f"복수 모델 순차 실행 (기본: {' '.join(_DEFAULT_MODELS)})")
+    ap.add_argument("--tasks", nargs="*", default=_KO_RETRIEVAL_TASKS,
+                    help="평가 태스크 목록 (기본: 한국어 6개)")
+    ap.add_argument("--out",               default="reports", help="결과 저장 루트 경로")
     ap.add_argument("--batch-size",        type=int, default=32,
                     help="query encode 배치 크기 (GPU: 32~64, CPU: 16)")
     ap.add_argument("--corpus-batch-size", type=int, default=None,
                     help="corpus encode 배치 크기 (미지정 시 --batch-size 값 사용)")
-    ap.add_argument("--model-dtype",  default="auto",
-                    choices=["auto", "fp32", "fp16", "bf16"])
+    ap.add_argument("--model-dtype", default="auto", choices=["auto", "fp32", "fp16", "bf16"])
     args = ap.parse_args()
 
     try:
@@ -418,8 +372,9 @@ def main() -> None:
     except ImportError:
         sys.exit("mteb 패키지가 필요합니다: pip install mteb")
 
-    os.makedirs(args.out, exist_ok=True)
+    import torch
 
+    os.makedirs(args.out, exist_ok=True)
     model_ids = [args.model] if args.model else (args.models or _DEFAULT_MODELS)
 
     tasks = mteb.get_tasks(
@@ -431,28 +386,11 @@ def main() -> None:
     print(f"[태스크] {len(tasks)}개: {[t.metadata.name for t in tasks]}")
     print(f"[모델]   {len(model_ids)}개: {', '.join(model_ids)}")
 
-    all_results = []
-    t0_total = time.time()
-
-    import torch
-
-    _mem("main 루프 시작")
-
-    for model_id in model_ids:
-        result = _run_model(
-            model_id, tasks, args.out,
-            args.batch_size, args.corpus_batch_size, args.model_dtype,
-        )
-        if result:
-            all_results.append(result)
-
-        # 모델 간 전환 시 메모리 정리
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print(f"  [GPU] 캐시 해제: alloc={torch.cuda.memory_allocated()/1e9:.2f}GB  "
-                  f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB", flush=True)
-        _mem(f"모델 전환 후 ({model_id} 완료)")
+    # corpus는 모든 모델이 공유 → 1회만 로딩
+    print(f"\n[corpus 병합] {len(tasks)}개 태스크 (1회 로딩)...", flush=True)
+    t0_merge = time.time()
+    combined_corpus, combined_queries, combined_qrels, task_names = _build_combined_corpus(tasks)
+    print(f"  병합 완료 ({time.time() - t0_merge:.0f}s)", flush=True)
 
     def _json_default(obj):
         try:
@@ -460,6 +398,38 @@ def main() -> None:
             return None if math.isnan(f) or math.isinf(f) else f
         except (TypeError, ValueError):
             return str(obj)
+
+    all_results = []
+    t0_total = time.time()
+    _mem("main 루프 시작")
+
+    for model_id in model_ids:
+        # 체크포인트: 이미 완료된 모델은 스킵
+        ckpt_path = os.path.join(args.out, model_id.replace("/", "_") + ".json")
+        if os.path.exists(ckpt_path):
+            print(f"\n[스킵] {model_id} — 결과 이미 존재: {ckpt_path}", flush=True)
+            with open(ckpt_path, encoding="utf-8") as f:
+                all_results.append(json.load(f))
+            continue
+
+        result = _run_model(
+            model_id,
+            combined_corpus, combined_queries, combined_qrels, task_names,
+            args.batch_size, args.corpus_batch_size, args.model_dtype,
+        )
+        if result:
+            all_results.append(result)
+            # 모델 완료 즉시 체크포인트 저장
+            with open(ckpt_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2, default=_json_default)
+            print(f"  [체크포인트] {ckpt_path}", flush=True)
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"  [GPU] 캐시 해제: alloc={torch.cuda.memory_allocated()/1e9:.2f}GB  "
+                  f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB", flush=True)
+        _mem(f"모델 전환 후 ({model_id} 완료)")
 
     summary_path = os.path.join(args.out, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
