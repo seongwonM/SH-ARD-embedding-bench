@@ -206,18 +206,34 @@ def _build_combined_corpus(tasks: list) -> tuple[dict, dict, dict]:
 # Retrieval 평가
 # ──────────────────────────────────────────────────────────────────────────────
 
+_ENCODE_CHUNK = 50_000  # sentence-transformers가 내부 numpy 배열을 미리 통째로 할당하는 현상 방지
+
+
 def _encode(model, texts: list[str], batch_size: int, show_progress: bool = True) -> np.ndarray:
     """
     모델 encode 후 L2 정규화.
-    MTEB 2.15 SentenceTransformerEncoderWrapper (task_metadata/hf_split/hf_subset 필수)
-    와 일반 SentenceTransformer 모두 지원.
+    texts 수가 _ENCODE_CHUNK 초과 시 청크 단위로 나눠 인코딩해
+    sentence-transformers의 전체 길이 기반 numpy 선(先)할당 OOM 방지.
+    MTEB 2.15 SentenceTransformerEncoderWrapper는 .model로 직접 위임.
     """
-    kw = {"batch_size": batch_size, "show_progress_bar": show_progress}
-    # MTEB 2.15 SentenceTransformerEncoderWrapper는 task_metadata 필수라 우회.
-    # .model 속성으로 내부 SentenceTransformer에 직접 위임.
     inner = getattr(model, "model", model)
-    embs = inner.encode(texts, **kw)
-    embs = np.array(embs)
+    kw = {"batch_size": batch_size, "show_progress_bar": show_progress}
+
+    if len(texts) <= _ENCODE_CHUNK:
+        embs = np.array(inner.encode(texts, **kw))
+    else:
+        chunks = []
+        n_chunks = math.ceil(len(texts) / _ENCODE_CHUNK)
+        for ci in range(n_chunks):
+            s, e = ci * _ENCODE_CHUNK, min((ci + 1) * _ENCODE_CHUNK, len(texts))
+            print(f"    encode chunk {ci+1}/{n_chunks} ({s:,}~{e:,})...", flush=True)
+            chunks.append(np.array(inner.encode(texts[s:e], **kw)))
+            _mem(f"    chunk {ci+1}/{n_chunks} 완료")
+            gc.collect()
+        embs = np.concatenate(chunks, axis=0)
+        del chunks
+        gc.collect()
+
     norms = np.linalg.norm(embs, axis=1, keepdims=True)
     return embs / np.maximum(norms, 1e-9)
 
@@ -228,6 +244,7 @@ def _evaluate_retrieval(
     queries: dict,
     qrels:   dict,
     batch_size: int,
+    corpus_batch_size: int | None = None,
     top_k: int = 100,
 ) -> dict:
     """
@@ -237,14 +254,15 @@ def _evaluate_retrieval(
     import pytrec_eval
 
     _mem("_evaluate_retrieval 진입")
+    corp_bs = corpus_batch_size if corpus_batch_size is not None else batch_size
 
     # corpus 인코딩
     corp_ids   = list(corpus.keys())
     corp_texts = [f"{corpus[d].get('title', '')} {corpus[d]['text']}".strip()
                   for d in corp_ids]
-    print(f"  corpus 인코딩 ({len(corp_ids):,}건)...", flush=True)
+    print(f"  corpus 인코딩 ({len(corp_ids):,}건, batch={corp_bs})...", flush=True)
     _mem("corpus encode 전")
-    corp_embs = _encode(model, corp_texts, batch_size, show_progress=True)
+    corp_embs = _encode(model, corp_texts, corp_bs, show_progress=True)
     print(f"  corp_embs shape={corp_embs.shape}  dtype={corp_embs.dtype}  "
           f"size={corp_embs.nbytes/1e9:.3f}GB", flush=True)
     del corp_texts
@@ -254,7 +272,7 @@ def _evaluate_retrieval(
     # query 인코딩
     q_ids   = list(queries.keys())
     q_texts = [queries[qid] for qid in q_ids]
-    print(f"  query 인코딩 ({len(q_ids):,}건)...", flush=True)
+    print(f"  query 인코딩 ({len(q_ids):,}건, batch={batch_size})...", flush=True)
     _mem("query encode 전")
     q_embs = _encode(model, q_texts, batch_size, show_progress=False)
     del q_texts
@@ -317,6 +335,7 @@ def _run_model(
     tasks: list,
     out_dir: str,
     batch_size: int,
+    corpus_batch_size: int | None = None,
     model_dtype: str = "auto",
 ) -> dict:
     import mteb
@@ -343,7 +362,8 @@ def _run_model(
 
     t0_eval = time.time()
     metrics = _evaluate_retrieval(
-        model, combined_corpus, combined_queries, combined_qrels, batch_size
+        model, combined_corpus, combined_queries, combined_qrels,
+        batch_size, corpus_batch_size,
     )
     elapsed = time.time() - t0_eval
 
@@ -385,8 +405,10 @@ def main() -> None:
     )
     ap.add_argument("--out",          default="reports",
                     help="결과 저장 루트 경로")
-    ap.add_argument("--batch-size",   type=int, default=32,
-                    help="encode 배치 크기 (GPU: 32~64, CPU: 16)")
+    ap.add_argument("--batch-size",        type=int, default=32,
+                    help="query encode 배치 크기 (GPU: 32~64, CPU: 16)")
+    ap.add_argument("--corpus-batch-size", type=int, default=None,
+                    help="corpus encode 배치 크기 (미지정 시 --batch-size 값 사용)")
     ap.add_argument("--model-dtype",  default="auto",
                     choices=["auto", "fp32", "fp16", "bf16"])
     args = ap.parse_args()
@@ -417,7 +439,10 @@ def main() -> None:
     _mem("main 루프 시작")
 
     for model_id in model_ids:
-        result = _run_model(model_id, tasks, args.out, args.batch_size, args.model_dtype)
+        result = _run_model(
+            model_id, tasks, args.out,
+            args.batch_size, args.corpus_batch_size, args.model_dtype,
+        )
         if result:
             all_results.append(result)
 

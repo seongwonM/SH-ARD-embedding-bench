@@ -16,4 +16,5 @@ COPY bench ./bench
 CMD ["python", "-m", "bench.mteb_runner", \
      "--model-dtype", "auto", \
      "--batch-size", "64", \
+     "--corpus-batch-size", "16", \
      "--out", "/workspace/reports"]
