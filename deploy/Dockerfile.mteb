@@ -18,4 +18,4 @@ COPY bench /app/bench
 
 VOLUME ["/model-cache", "/datasets", "/reports"]
 
-CMD ["python", "-m", "bench.mteb_runner", "--out", "/reports"]
+CMD ["python", "-m", "bench.validate_combined"]

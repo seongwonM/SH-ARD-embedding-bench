@@ -51,17 +51,7 @@ spec:
           command:
             - python
             - -m
-            - bench.mteb_runner
-            - --model
-            - sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-            - --task-types
-            - Retrieval
-            - --languages
-            - kor
-            - --out
-            - /reports
-            - --batch-size
-            - "32"
+            - bench.validate_combined
           env:
             - { name: HF_HOME, value: "/model-cache" }
             - { name: HF_DATASETS_CACHE, value: "/datasets/.cache" }
