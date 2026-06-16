@@ -183,10 +183,19 @@ def _encode(model, texts: list[str], batch_size: int, show_progress: bool = True
         _log_every = max(1, n_chunks // 4)
         for ci in range(n_chunks):
             s, e = ci * _ENCODE_CHUNK, min((ci + 1) * _ENCODE_CHUNK, len(texts))
-            chunks.append(np.array(inner.encode(texts[s:e], **kw)))
-            gc.collect()
+            raw = inner.encode(texts[s:e], **kw)
+            # encode()가 GPU 텐서를 반환하는 경우(비-ST 모델) CPU로 명시적 이동
+            if hasattr(raw, "cpu"):
+                raw = raw.detach().cpu()
+            chunks.append(np.array(raw))
+            del raw
+            # CUDA 비동기 연산 완전 종료 후 캐시 해제
             if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
                 _torch.cuda.empty_cache()
+            gc.collect()
+            if ci == 0:
+                _mem(f"chunk0 GPU")
             if (ci + 1) % _log_every == 0 or ci + 1 == n_chunks:
                 print(f"    encode {e:,}/{len(texts):,}", flush=True)
         embs = np.concatenate(chunks, axis=0)
