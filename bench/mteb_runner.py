@@ -29,9 +29,9 @@ import numpy as np
 
 _DEFAULT_MODELS = [
     "BAAI/bge-m3",
-    "Qwen/Qwen3-0.6B",
-    "Qwen/Qwen3-4B",
-    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-Embedding-0.6B",
+    "Qwen/Qwen3-Embedding-4B",
+    "Qwen/Qwen3-Embedding-8B",
 ]
 
 _KO_RETRIEVAL_TASKS = [
@@ -302,8 +302,13 @@ def _run_model(
     print(f"  모델: {model_id}  (dtype={model_dtype})")
     print(f"{'='*64}")
 
+    _model_kwargs = {
+        "torch_dtype": _DTYPE_MAP[model_dtype],
+        # sdpa: PyTorch 내장 flash/mem-efficient SDPA 강제 → math 폴백 방지 (OOM·속도 개선)
+        "attn_implementation": "sdpa",
+    }
     try:
-        model = mteb.get_model(model_id, model_kwargs={"torch_dtype": _DTYPE_MAP[model_dtype]})
+        model = mteb.get_model(model_id, model_kwargs=_model_kwargs)
     except TypeError:
         model = mteb.get_model(model_id)
     except Exception as e:

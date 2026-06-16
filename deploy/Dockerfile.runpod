@@ -28,6 +28,6 @@ CMD ["bash", "-c", \
         || echo '[startup] git clone 실패 — 빌드된 코드로 실행'; \
       python -m bench.mteb_runner \
         --model-dtype auto \
-        --batch-size 64 \
-        --corpus-batch-size 16 \
+        --batch-size 256 \
+        --corpus-batch-size 64 \
         --out /workspace/reports"]
