@@ -38,3 +38,18 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ env.IMAGE }}:latest
+
+      - name: Restart RunPod pod
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_POD_ID: ${{ secrets.RUNPOD_POD_ID }}
+        run: |
+          if [ -z "$RUNPOD_API_KEY" ] || [ -z "$RUNPOD_POD_ID" ]; then
+            echo "RUNPOD_API_KEY 또는 RUNPOD_POD_ID 미설정 — 재시작 스킵"
+            exit 0
+          fi
+          curl -s -X POST "https://api.runpod.io/v2/pod/${RUNPOD_POD_ID}/stop" \
+            -H "Authorization: Bearer ${RUNPOD_API_KEY}" && sleep 5
+          curl -s -X POST "https://api.runpod.io/v2/pod/${RUNPOD_POD_ID}/start" \
+            -H "Authorization: Bearer ${RUNPOD_API_KEY}"
+          echo "Pod 재시작 요청 완료"

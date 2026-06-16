@@ -51,24 +51,21 @@ _DTYPE_MAP = {"auto": "auto", "fp32": "float32", "fp16": "float16", "bf16": "bfl
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _mem(label: str = "") -> None:
-    """CPU(RSS) + GPU 메모리를 한 줄로 출력."""
     parts = []
     try:
         import psutil
-        parts.append(f"CPU RSS={psutil.Process().memory_info().rss / 1e9:.2f}GB")
+        parts.append(f"CPU={psutil.Process().memory_info().rss / 1e9:.1f}GB")
     except ImportError:
         pass
     try:
         import torch
         if torch.cuda.is_available():
-            parts.append(
-                f"GPU alloc={torch.cuda.memory_allocated()/1e9:.2f}GB "
-                f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB"
-            )
+            parts.append(f"GPU={torch.cuda.memory_allocated()/1e9:.1f}GB")
     except ImportError:
         pass
-    tag = f"[MEM] {label}: " if label else "[MEM] "
-    print(tag + ("  ".join(parts) if parts else "(psutil/torch 없음)"), flush=True)
+    if parts:
+        tag = f"[MEM:{label}] " if label else "[MEM] "
+        print(tag + " ".join(parts), flush=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -82,21 +79,17 @@ def _load_task_data(task) -> tuple[dict, dict, dict]:
     """
     split = task.metadata.eval_splits[0]
 
-    before = getattr(task, "_data_loaded", "attr-missing")
     try:
         task._data_loaded = False
     except Exception:
         pass
-    print(f"    [_data_loaded] {task.metadata.name}: {before} → {getattr(task, '_data_loaded', '?')}", flush=True)
 
-    _mem(f"load_data 전 ({task.metadata.name})")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
             task.load_data(eval_splits=[split])
         except TypeError:
             task.load_data()
-    _mem(f"load_data 후 ({task.metadata.name})")
 
     # ── 새 포맷 (MTEB 2.15+) ─────────────────────────────────────────────────
     ds = getattr(task, "dataset", None)
@@ -109,7 +102,6 @@ def _load_task_data(task) -> tuple[dict, dict, dict]:
                        for r in inner["corpus"]}
             queries = {r["id"]: r["text"] for r in inner["queries"]}
             qrels   = dict(inner.get("relevant_docs", {}))
-            print(f"    [새포맷] corpus={len(corpus):,}  queries={len(queries):,}  qrels={len(qrels):,}", flush=True)
             return corpus, queries, qrels
 
     # ── 구 포맷 (BEIR — PublicHealthQA) ──────────────────────────────────────
@@ -131,7 +123,6 @@ def _load_task_data(task) -> tuple[dict, dict, dict]:
         qrels = ((getattr(task, "relevant_docs", {}) or {})
                  .get(lang_key, {}).get(split_key, {})) or {}
 
-        print(f"    [구포맷] corpus={len(corpus):,}  queries={len(queries):,}  qrels={len(qrels):,}", flush=True)
         return corpus, queries, qrels
 
     raise ValueError(f"{task.metadata.name}: 데이터 로드 실패")
@@ -149,9 +140,8 @@ def _build_combined_corpus(tasks: list) -> tuple[dict, dict, dict, list[str]]:
     for task in tasks:
         name   = task.metadata.name
         prefix = name + "__"
-        print(f"  [로딩] {name}", flush=True)
-        _mem(f"병합 전 ({name})")
         corpus, queries, qrels = _load_task_data(task)
+        print(f"  [로딩] {name}: corpus={len(corpus):,}  queries={len(queries):,}", flush=True)
 
         for did, doc in corpus.items():
             combined_corpus[prefix + did] = doc
@@ -160,15 +150,11 @@ def _build_combined_corpus(tasks: list) -> tuple[dict, dict, dict, list[str]]:
         for qid, rels in qrels.items():
             combined_qrels[prefix + qid] = {prefix + did: score for did, score in rels.items()}
 
-        _mem(f"병합 후 ({name}, 누적 corpus={len(combined_corpus):,})")
-
     print(
         f"  [합산] corpus {len(combined_corpus):,}건 · "
-        f"queries {len(combined_queries):,}건 · "
-        f"qrel pairs {sum(len(v) for v in combined_qrels.values()):,}건",
+        f"queries {len(combined_queries):,}건",
         flush=True,
     )
-    _mem("_build_combined_corpus 완료")
     return combined_corpus, combined_queries, combined_qrels, [t.metadata.name for t in tasks]
 
 
@@ -194,14 +180,15 @@ def _encode(model, texts: list[str], batch_size: int, show_progress: bool = True
         import torch as _torch
         chunks = []
         n_chunks = math.ceil(len(texts) / _ENCODE_CHUNK)
+        _log_every = max(1, n_chunks // 4)
         for ci in range(n_chunks):
             s, e = ci * _ENCODE_CHUNK, min((ci + 1) * _ENCODE_CHUNK, len(texts))
-            print(f"    encode chunk {ci+1}/{n_chunks} ({s:,}~{e:,})...", flush=True)
             chunks.append(np.array(inner.encode(texts[s:e], **kw)))
-            _mem(f"    chunk {ci+1}/{n_chunks} 완료")
             gc.collect()
             if _torch.cuda.is_available():
-                _torch.cuda.empty_cache()  # reserved pool 반환 — gc만으론 CUDA 메모리 미해제
+                _torch.cuda.empty_cache()
+            if (ci + 1) % _log_every == 0 or ci + 1 == n_chunks:
+                print(f"    encode {e:,}/{len(texts):,}", flush=True)
         embs = np.concatenate(chunks, axis=0)
         del chunks
         gc.collect()
@@ -229,31 +216,24 @@ def _evaluate_retrieval(
     """
     import pytrec_eval
 
-    _mem("_evaluate_retrieval 진입")
     corp_bs = corpus_batch_size if corpus_batch_size is not None else batch_size
 
     corp_ids   = list(corpus.keys())
     corp_texts = [f"{corpus[d].get('title', '')} {corpus[d]['text']}".strip() for d in corp_ids]
-    print(f"  corpus 인코딩 ({len(corp_ids):,}건, batch={corp_bs})...", flush=True)
-    _mem("corpus encode 전")
+    print(f"  corpus 인코딩 ({len(corp_ids):,}건)...", flush=True)
     corp_embs = _encode(model, corp_texts, corp_bs, show_progress=True)
-    print(f"  corp_embs shape={corp_embs.shape}  dtype={corp_embs.dtype}  "
-          f"size={corp_embs.nbytes/1e9:.3f}GB", flush=True)
     del corp_texts
     gc.collect()
-    _mem("corpus encode 후")
+    _mem("corpus")
 
     q_ids   = list(queries.keys())
     q_texts = [queries[qid] for qid in q_ids]
-    print(f"  query 인코딩 ({len(q_ids):,}건, batch={batch_size})...", flush=True)
-    _mem("query encode 전")
+    print(f"  query 인코딩 ({len(q_ids):,}건)...", flush=True)
     q_embs = _encode(model, q_texts, batch_size, show_progress=False)
     del q_texts
     gc.collect()
-    _mem("query encode 후")
 
-    print(f"  top-{top_k} 검색 ({len(q_ids):,} queries × {len(corp_ids):,} docs)...", flush=True)
-    _mem("top-k 검색 전")
+    print(f"  top-{top_k} 검색...", flush=True)
     run: dict = {}
     for start in range(0, len(q_ids), 256):
         end    = min(start + 256, len(q_ids))
@@ -265,7 +245,6 @@ def _evaluate_retrieval(
 
     del corp_embs, q_embs
     gc.collect()
-    _mem("top-k 검색 후")
 
     binary_qrels = {
         qid: {did: 1 for did, s in rels.items() if s >= 1}
@@ -279,7 +258,6 @@ def _evaluate_retrieval(
     per_query = evaluator.evaluate(run)
     del run, binary_qrels
     gc.collect()
-    _mem("pytrec_eval 완료")
 
     def _avg(key: str) -> float | None:
         vals = [v.get(key, 0.0) for v in per_query.values()]
@@ -315,7 +293,6 @@ def _run_model(
     print(f"  모델: {model_id}  (dtype={model_dtype})")
     print(f"{'='*64}")
 
-    _mem("모델 로드 전")
     try:
         model = mteb.get_model(model_id, model_kwargs={"torch_dtype": _DTYPE_MAP[model_dtype]})
     except TypeError:
@@ -323,7 +300,7 @@ def _run_model(
     except Exception as e:
         print(f"[ERROR] 모델 로드 실패: {e}")
         return {}
-    _mem("모델 로드 후")
+    _mem("로드")
 
     t0 = time.time()
     metrics = _evaluate_retrieval(
@@ -401,7 +378,6 @@ def main() -> None:
 
     all_results = []
     t0_total = time.time()
-    _mem("main 루프 시작")
 
     for model_id in model_ids:
         # 체크포인트: 이미 완료된 모델은 스킵
@@ -427,9 +403,6 @@ def main() -> None:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print(f"  [GPU] 캐시 해제: alloc={torch.cuda.memory_allocated()/1e9:.2f}GB  "
-                  f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB", flush=True)
-        _mem(f"모델 전환 후 ({model_id} 완료)")
 
     summary_path = os.path.join(args.out, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:

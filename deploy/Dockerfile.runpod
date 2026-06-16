@@ -23,7 +23,7 @@ CMD ["bash", "-c", \
       AUTH_REPO=${GH_TOKEN:+https://${GH_TOKEN}@github.com/seongwonM/SH-ARD-embedding-bench.git}; \
       TARGET=${AUTH_REPO:-$REPO}; \
       echo '[startup] GitHub에서 최신 코드 pull...'; \
-      git clone --depth=1 $TARGET /tmp/latest-code 2>&1 && cp -rf /tmp/latest-code/bench /app/ \
+      rm -rf /tmp/latest-code && git clone --depth=1 $TARGET /tmp/latest-code 2>&1 && cp -rf /tmp/latest-code/bench /app/ \
         && echo '[startup] 코드 업데이트 완료' \
         || echo '[startup] git clone 실패 — 빌드된 코드로 실행'; \
       python -m bench.mteb_runner \
