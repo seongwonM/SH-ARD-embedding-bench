@@ -229,9 +229,19 @@ def _evaluate_retrieval(
 
     corp_ids   = list(corpus.keys())
     corp_texts = [f"{corpus[d].get('title', '')} {corpus[d]['text']}".strip() for d in corp_ids]
-    print(f"  corpus 인코딩 ({len(corp_ids):,}건)...", flush=True)
-    corp_embs = _encode(model, corp_texts, corp_bs, show_progress=False)
-    del corp_texts
+    total = len(corp_texts)
+    print(f"  corpus 인코딩 ({total:,}건)...", flush=True)
+    _n_report = 4
+    _part = math.ceil(total / _n_report)
+    _parts = []
+    for _i in range(_n_report):
+        _s, _e = _i * _part, min((_i + 1) * _part, total)
+        if _s >= total:
+            break
+        _parts.append(_encode(model, corp_texts[_s:_e], corp_bs, show_progress=False))
+        print(f"    corpus {_e:,}/{total:,} ({_e * 100 // total}%)", flush=True)
+    corp_embs = np.concatenate(_parts, axis=0)
+    del _parts, corp_texts
     gc.collect()
     _mem("corpus")
 
