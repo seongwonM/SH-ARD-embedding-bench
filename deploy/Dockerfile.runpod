@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime
+FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
 
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/workspace/models \
