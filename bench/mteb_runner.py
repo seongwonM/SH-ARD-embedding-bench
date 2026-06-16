@@ -9,7 +9,7 @@ usage:
   python -m bench.mteb_runner --model BAAI/bge-m3
 
   # 복수 모델 순차 실행 (RunPod 권장)
-  python -m bench.mteb_runner --models BAAI/bge-m3 Qwen/Qwen3-0.6B
+  python -m bench.mteb_runner --models BAAI/bge-m3 Qwen/Qwen3-Embedding-0.6B
 
   # 특정 태스크만 (MIRACL 제외 등)
   python -m bench.mteb_runner --model BAAI/bge-m3 --tasks AutoRAGRetrieval Ko-StrategyQA
@@ -230,7 +230,7 @@ def _evaluate_retrieval(
     corp_ids   = list(corpus.keys())
     corp_texts = [f"{corpus[d].get('title', '')} {corpus[d]['text']}".strip() for d in corp_ids]
     print(f"  corpus 인코딩 ({len(corp_ids):,}건)...", flush=True)
-    corp_embs = _encode(model, corp_texts, corp_bs, show_progress=True)
+    corp_embs = _encode(model, corp_texts, corp_bs, show_progress=False)
     del corp_texts
     gc.collect()
     _mem("corpus")
