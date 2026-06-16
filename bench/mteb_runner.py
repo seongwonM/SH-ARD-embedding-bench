@@ -314,8 +314,7 @@ def _run_model(
 
     _model_kwargs = {
         "torch_dtype": _DTYPE_MAP[model_dtype],
-        # sdpa: PyTorch 내장 flash/mem-efficient SDPA 강제 → math 폴백 방지 (OOM·속도 개선)
-        "attn_implementation": "sdpa",
+        "attn_implementation": "flash_attention_2",
     }
     try:
         model = mteb.get_model(model_id, model_kwargs=_model_kwargs)

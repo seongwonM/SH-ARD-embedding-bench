@@ -10,6 +10,7 @@ WORKDIR /app
 
 COPY deploy/requirements-mteb.txt ./
 RUN pip install --no-cache-dir -r requirements-mteb.txt \
+ && pip install --no-cache-dir flash-attn --no-build-isolation \
  && apt-get update && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
