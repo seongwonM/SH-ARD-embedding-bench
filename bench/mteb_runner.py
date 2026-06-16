@@ -301,10 +301,6 @@ def _run_model(
         print(f"[ERROR] 모델 로드 실패: {e}")
         return {}
 
-    inner = getattr(model, "model", model)
-    if getattr(inner, "max_seq_length", None) is None or inner.max_seq_length > 512:
-        inner.max_seq_length = 512
-        print(f"  max_seq_length → 512", flush=True)
     _mem("로드")
 
     t0 = time.time()
